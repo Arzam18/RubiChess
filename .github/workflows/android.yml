@@ -1,4 +1,4 @@
-name: RubiChess for Android
+name: RubiChess
 
 on:
   workflow_dispatch:
@@ -18,6 +18,11 @@ jobs:
           unzip -q android-ndk-r26d-linux.zip
           echo "ANDROID_NDK_HOME=$PWD/android-ndk-r26d" >> $GITHUB_ENV
           echo "$PWD/android-ndk-r26d/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+
+      - name: Patch net embedding for cross-compile
+        run: |
+          cd src
+          sed -i "s|@ld -r -b binary \$(NETBIN) -o \$(NETOBJ)|@\$(ANDROID_NDK_HOME)/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-objcopy -I binary -O elf64-littleaarch64 -B aarch64 \$(NETBIN) \$(NETOBJ)|" Makefile
 
       - name: Build
         run: |

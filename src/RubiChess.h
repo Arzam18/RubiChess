@@ -18,10 +18,7 @@
 #pragma once
 
 #define VERNUMLEGACY 2026
-#define NNUEDEFAULT nn-b069721887-20260102.nnue
-
-// enable this switch for faster SSE2 code using 16bit integers
-#define FASTSSE2
+#define NNUEDEFAULT nn-da9c99e92a-20260819.nnue
 
 // Enable to get statistical values about various search features
 //#define STATISTICS
@@ -50,8 +47,8 @@
 // Enable this to enable NNUE training code
 //#define NNUELEARN
 
-// Enable this to enable NNUE debug output
-//#define NNUEDEBUG
+// Enable this to enable NNUE debug output 1=everything 2=only last layer
+//#define NNUEDEBUG 1
 
 // Enable this to compile support for asserts including stack trace
 // MSVC only, link with DbgHelp.lib
@@ -135,7 +132,13 @@ namespace rubichess {
 
 #else //_WIN32
 
+
+#ifdef NDEBUG
 #define myassert(expression, pos, num, ...) (void)(0)
+#else
+#include <cassert>
+#define myassert(expression, pos, num, ...) assert(expression)
+#endif
 void Sleep(long x);
 #if defined(__ANDROID__) or defined(__APPLE__)
 #define allocalign64(x) malloc(x)
@@ -145,6 +148,8 @@ void Sleep(long x);
 #define freealigned64(x) free(x)
 #endif
 #endif
+
+#define pad64(x) ((x + 63) / 64 * 64)
 
 #ifdef USE_LIBNUMA
 #include <numa.h>
@@ -807,8 +812,9 @@ void GetStackWalk(chessposition *pos, const char* message, const char* _File, in
 // NNUE stuff
 //
 #define NNUEDEFAULTSTR TOSTRING(NNUEDEFAULT)
+#define NUMTHREATSFEATURES 0xed30
 
-enum NnueType { NnueDisabled = 0, NnueArchV1, NnueArchV5 };
+enum NnueType { NnueDisabled = 0, NnueArchV1, NnueArchV5, NnueArchV13 };
 
 // The following constants were introduced in original NNUE port from Shogi
 #define NNUEFILEVERSIONROTATE       0x7AF32F16u
@@ -820,34 +826,38 @@ enum NnueType { NnueDisabled = 0, NnueArchV1, NnueArchV5 };
 #define NNUECLIPPEDRELUHASH         0x538D24C7u
 #define NNUEFEATUREHASH_HalfKP      0x5D69D5B8u
 #define NNUEFEATUTEHASH_HalfKAv2_hm 0x7f234cb8u
+#define NNUEFEATUTEHASH_Threats     0x8f234cb8u
 #define NNUEINPUTSLICEHASH          0xEC42E90Du
 
 #define ORIENT(c,i) ((c) ? (i) ^ 0x3f : (i))
 #define HMORIENT(c,i,k) (i ^ (bool(c) * 56) ^ ((FILE(k) < 4) * 7))
 #define MULTIPLEOFN(i,n) (((i) + (n - 1)) / n * n)
 
-#if defined(USE_SSE2) && !defined(USE_SSSE3) && defined FASTSSE2
-// for native SSE2 platforms we have faster intrinsics for 16bit integers
-#define USE_FASTSSE2
-typedef int16_t weight_t;
-typedef int16_t clipped_t;
-#else
 typedef int8_t weight_t;
 typedef int8_t clipped_t;
-#endif
 
-// All pieces and both kings for HalfKA are inputs => 32 dimensions
-typedef struct {
+enum NnueFeatureType { NnueFeatuteHalfKa, NnueFeatureThreat };
+
+class NnueIndexList {
+public:
     size_t size;
-    unsigned values[32];
-} NnueIndexList;
+    unsigned values[128];
+};
+
 
 typedef struct {
     int dirtyNum;
     PieceCode pc[3];
     int from[3];
     int to[3];
-} DirtyPiece;
+} DirtyPieces;
+
+typedef struct {
+    size_t size;
+    uint32_t threatdata[96];
+    unsigned us;
+    unsigned prevKsq, ksq;
+} DirtyThreats;
 
 
 class NnueNetsource {
@@ -872,8 +882,8 @@ class NnueArchitecture
 public:
     virtual bool ReadFeatureWeights(NnueNetsource* nr, bool bpz) = 0;
     virtual bool ReadWeights(NnueNetsource* nr, uint32_t nethash) = 0;
-    virtual void WriteFeatureWeights(NnueNetsource* nr, bool bpz) = 0;
-    virtual void WriteWeights(NnueNetsource* nr, uint32_t nethash) = 0;
+    virtual bool WriteFeatureWeights(NnueNetsource* nr, bool bpz) = 0;
+    virtual bool WriteWeights(NnueNetsource* nr, uint32_t nethash) = 0;
     virtual void RescaleLastLayer(int ratio64) = 0;
     virtual string GetArchName() = 0;
     virtual string GetArchDescription() = 0;
@@ -884,6 +894,8 @@ public:
     virtual int16_t* GetFeatureWeight() = 0;
     virtual int16_t* GetFeatureBias() = 0;
     virtual int32_t* GetFeaturePsqtWeight() = 0;
+    virtual int8_t* GetFeatureThreatWeight() = 0;
+    virtual int32_t* GetFeatureThreatPsqtWeight() = 0;
     virtual uint32_t GetFileVersion() = 0;
     virtual int16_t* CreateAccumulationStack() = 0;
     virtual int32_t* CreatePsqtAccumulationStack() = 0;
@@ -892,6 +904,7 @@ public:
     virtual unsigned int GetAccumulationSize() = 0;
     virtual unsigned int GetPsqtAccumulationSize() = 0;
     virtual size_t GetNetworkFilesize() = 0;
+    virtual int GetPermutedWeightIndex(int i, bool reverse = false) = 0;
 #ifdef STATISTICS
     virtual void SwapInputNeurons(unsigned int i1, unsigned int i2) = 0;
     virtual void Statistics(bool verbose, bool sort) = 0;
@@ -915,18 +928,20 @@ public:
 
     NnueLayer(NnueLayer* prev) { previous = prev; }
     virtual bool ReadWeights(NnueNetsource* nr) = 0;
-    virtual void WriteWeights(NnueNetsource* nr) = 0;
+    virtual bool WriteWeights(NnueNetsource* nr) = 0;
     virtual uint32_t GetHash() = 0;
 };
 
 
-template <int ftdims, int inputdims, int psqtbuckets>
+template <int ftdims, int ftthreatdims, int outputdims, int psqtbuckets>
 class NnueFeatureTransformer : public NnueLayer
 {
 public:
-    alignas(64) int16_t bias[ftdims];
-    alignas(64) int16_t weight[ftdims * inputdims];
-    alignas(64) int32_t psqtWeights[psqtbuckets ? psqtbuckets * inputdims : 1];    // hack to avoid zero-sized array
+    alignas(64) int16_t bias[outputdims];
+    alignas(64) int8_t threatweights[ftthreatdims ? ftthreatdims * outputdims : 1];    // hack to avoid zero-sized array
+    alignas(64) int16_t weight[ftdims * outputdims];
+    alignas(64) int32_t threatpsqtWeights[psqtbuckets * ftthreatdims ? psqtbuckets * ftthreatdims : 1];    // hack to avoid zero-sized array
+    alignas(64) int32_t psqtWeights[psqtbuckets ? psqtbuckets * ftdims : 1];    // hack to avoid zero-sized array
 
     NnueFeatureTransformer() : NnueLayer(NULL) {}
     bool ReadFeatureWeights(NnueNetsource* nr, bool bpz);
@@ -934,31 +949,38 @@ public:
         if (previous) return previous->ReadWeights(nr);
         return true;
     }
-    void WriteFeatureWeights(NnueNetsource* nr, bool bpz);
-    void WriteWeights(NnueNetsource* nr) {
+    bool WriteFeatureWeights(NnueNetsource* nr, bool bpz);
+    bool WriteWeights(NnueNetsource* nr) {
         if (previous)
-            previous->WriteWeights(nr);
+            return previous->WriteWeights(nr);
+        return true;
     }
     uint32_t GetFtHash(NnueType nt) {
         if (nt == NnueArchV5)
             return NNUEFEATUTEHASH_HalfKAv2_hm;
+        else if (nt == NnueArchV13)
+            return ((NNUEFEATUTEHASH_Threats << 1) | (NNUEFEATUTEHASH_Threats >> 31)) ^ NNUEFEATUTEHASH_HalfKAv2_hm;
         else
             return NNUEFEATUREHASH_HalfKP;
     }
     uint32_t GetHash() {
-        return NNUEINPUTSLICEHASH ^ (ftdims * 2);
+        return NNUEINPUTSLICEHASH ^ (outputdims * 2);
     };
 #ifdef STATISTICS
     void SwapWeights(unsigned int i1, unsigned int i2) {
         int16_t bias_temp = bias[i1];
         bias[i1] = bias[i2];
         bias[i2] = bias_temp;
-        for (unsigned int i = 0; i < inputdims; i++)
+        for (unsigned int i = 0; i < outputdims; i++)
         {
             int offset = i * ftdims;
             int16_t weight_temp = weight[offset + i1];
             weight[offset + i1] = weight[offset + i2];
             weight[offset + i2] = weight_temp;
+            offset = i * ftthreatdims;
+            int8_t threatweight_temp = threatweights[offset + i1];
+            threatweights[offset + i1] = threatweights[offset + i2];
+            threatweights[offset + i2] = threatweight_temp;
         }
     }
 #endif
@@ -972,9 +994,10 @@ public:
     bool ReadWeights(NnueNetsource* nr) {
         return (previous ? previous->ReadWeights(nr) : true);
     }
-    void WriteWeights(NnueNetsource* nr) {
+    bool WriteWeights(NnueNetsource* nr) {
         if (previous)
-            previous->WriteWeights(nr);
+            return previous->WriteWeights(nr);
+        return true;
     }
     uint32_t GetHash() {
         return NNUECLIPPEDRELUHASH + previous->GetHash();
@@ -990,9 +1013,10 @@ public:
     bool ReadWeights(NnueNetsource* nr) {
         return (previous ? previous->ReadWeights(nr) : true);
     }
-    void WriteWeights(NnueNetsource* nr) {
+    bool WriteWeights(NnueNetsource* nr) {
         if (previous)
-            previous->WriteWeights(nr);
+            return previous->WriteWeights(nr);
+        return true;
     }
     uint32_t GetHash() {
         return NNUECLIPPEDRELUHASH + previous->GetHash();
@@ -1079,7 +1103,7 @@ public:
     NnueNetworkLayer(NnueLayer* prev) : NnueLayer(prev) {}
     bool ReadWeights(NnueNetsource* nr);
     bool OverflowPossible();
-    void WriteWeights(NnueNetsource* nr);
+    bool WriteWeights(NnueNetsource* nr);
     uint32_t GetHash() {
         return (NNUENETLAYERHASH + outputdims) ^ (previous->GetHash() >> 1) ^ (previous->GetHash() << 31);
     }
@@ -1115,7 +1139,7 @@ public:
 void NnueInit();
 void NnueRemove();
 bool NnueReadNet(NnueNetsource* nr);
-void NnueWriteNet(vector<string> args);
+bool NnueWriteNet(vector<string> args);
 #ifdef EVALOPTIONS
 void NnueRegisterEvals();
 #endif
@@ -1546,6 +1570,7 @@ extern U64 rankMask[64];
 // 00000000
 // 00000000
 extern U64 betweenMask[64][64];
+extern U64 raypassMask[64][64];
 
 extern int squareDistance[64][64];
 
@@ -1625,6 +1650,8 @@ extern U64 king_attacks[64];
 extern U64 pawn_moves_to[64][2];
 extern U64 pawn_moves_to_double[64][2];
 extern U64 epthelper[64];
+extern U64 pseudoattacks[8][64];
+extern U64 pawnpushorattacks[2][64];
 
 struct SMagic {
     U64 mask;  // to mask relevant squares of both lines (no outer squares)
@@ -1677,6 +1704,8 @@ struct AccumulatorCache {
     int16_t* accumulation;
     int32_t* psqtaccumulation;
 };
+
+U64 pieceTargets(PieceType pt, int from, U64 occ);
 
 // Replace the occupied bitboards with the first two so far unused piece bitboards
 #define occupied00 piece00
@@ -1737,8 +1766,7 @@ public:
     uint32_t countermove[14][64];
     int16_t pawncorrectionhistory[2][CORRHISTSIZE];
     int16_t nonpawncorrectionhistory[2][2][CORRHISTSIZE];
-    int16_t* prerootconthistptr[6];
-    int16_t* conthistptr[MAXDEPTH];
+    int16_t* conthistptr[MAXDEPTH + 6];
 
     chessmovestack prerootmovestack[PREROOTMOVES];      // explicit copy from rootpos up to frame prerootmovenum including first frame of regular stack
     chessmovestack movestack[MAXDEPTH];                 // frame 0 copied from rootpos
@@ -1775,12 +1803,16 @@ public:
     uint32_t multipvtable[MAXMULTIPV][MAXDEPTH];
     uint32_t lastpv[MAXDEPTH];
     int CurrentMoveNum[MAXDEPTH];
-    Pawnhash pwnhsh;                                    // init in alloc
-    bool computationState[MAXDEPTH][2];
-    int16_t* accumulation;
-    int32_t* psqtAccumulation;
+    Pawnhash pwnhsh;                                   // init in alloc
+    bool halfkacomputationState[MAXDEPTH][2];
+    bool threatcomputationState[MAXDEPTH][2];
+    int16_t* halfkaaccumulation;
+    int16_t* threataccumulation;
+    int32_t* psqthalfkaAccumulation;
+    int32_t* psqtthreatAccumulation;
     AccumulatorCache accucache;
-    DirtyPiece dirtypiece[MAXDEPTH];
+    DirtyPieces dirtypieces[MAXDEPTH];
+    DirtyThreats dirtythreats[MAXDEPTH];
     uint32_t quietMoves[MAXDEPTH][MAXMOVELISTLENGTH];
     uint32_t tacticalMoves[MAXDEPTH][MAXMOVELISTLENGTH];
     alignas(64) MoveSelector moveSelector[MAXDEPTH];
@@ -1807,9 +1839,9 @@ public:
     string getCoeffString();
 #endif
     bool w2m();
-    void BitboardSet(int index, PieceCode p);
-    void BitboardClear(int index, PieceCode p);
-    void BitboardMove(int from, int to, PieceCode p);
+    void BitboardSet(int index, PieceCode p, DirtyThreats* dt = nullptr);
+    void BitboardClear(int index, PieceCode p, DirtyThreats* dt = nullptr);
+    void BitboardMove(int from, int to, PieceCode p, DirtyThreats* dt = nullptr);
     void BitboardPrint(U64 b);
     int getFromFen(const char* sFen);
     void initCastleRights(int rookfiles[2][2], int kingfile[2]);
@@ -1828,6 +1860,7 @@ public:
     void preparePosition();
     void prepareStack();
     string movesOnStack();
+    template<bool ComputeRay = true> void update_piece_threats(unsigned pc, bool putPiece, unsigned s, DirtyThreats* dt, U64 noRaysContaining = 0xffffffffffffffff);
     template <bool LiteMode> bool playMove(uint32_t mc);
     template <bool LiteMode> void unplayMove(uint32_t mc);
     void playNullMove();
@@ -1885,15 +1918,20 @@ public:
     void pvdebugout();
 #endif
     int testRepetition();
-    template <NnueType Nt, Color c> void HalfkpAppendActiveIndices(NnueIndexList *active);
-    template <NnueType Nt, Color c> void HalfkpAppendChangedIndices(DirtyPiece* dp, NnueIndexList *add, NnueIndexList *remove);
-    template <NnueType Nt, Color c, int N> bool GetAcccumulatorUpdateArray(int* updaterequest);
-    template <NnueType Nt, Color c, unsigned int NnueFtHalfdims, unsigned int NnuePsqtBuckets, int N> void AccumulatorIncrementalUpdate(int* updaterequest);
-    template <NnueType Nt, Color c, unsigned int NnueFtHalfdims, unsigned int NnuePsqtBuckets> void AccumulatorRefresh();
+    //template <NnueType Nt, Color c> void HalfkpAppendActiveIndices(NnueIndexList *active);
+    template <NnueType Nt, Color c> void HalfkaAppendChangedIndices(DirtyPieces* dp, NnueIndexList *add, NnueIndexList *remove);
+    template <NnueType Nt, Color c> void ThreatsAppendChangedIndices(DirtyThreats* dt, NnueIndexList *add, NnueIndexList *remove);
+    template <Color perspective> void ThreatsAppendActiveIndices(NnueIndexList* active);
+    template <NnueType Nt, Color c, int N> bool GetHalfkaAcccumulatorUpdateArray(int* updaterequest);
+    template <NnueType Nt, Color c, int N> bool GetThreatAcccumulatorUpdateArray(int* updaterequest);
+    template <NnueType Nt, Color c, unsigned int NnueFtHalfdims, unsigned int NnuePsqtBuckets, int N, NnueFeatureType Ft> void AccumulatorIncrementalUpdate(int* updaterequest);
+    template <NnueType Nt, Color c, unsigned int NnueFtHalfdims, unsigned int NnuePsqtBuckets> void HalfkaAccumulatorRefresh();
+    template <NnueType Nt, Color c, unsigned int NnueFtHalfdims, unsigned int NnuePsqtBuckets> void ThreatAccumulatorRefresh();
     template <NnueType Nt, Color c, unsigned int NnueFtHalfdims, unsigned int NnuePsqtBuckets> void AccumulatorUpdate();
     template <NnueType Nt, Color c, unsigned int NnueFtHalfdims, unsigned int NnuePsqtBuckets> void AccumulatorSpeculativeUpdate();
+    template <Color c, unsigned int NnueFtHalfdims, unsigned int NnuePsqtBuckets> void ThreatsAccumulatorRefresh();
 #ifdef NNUEDEBUG
-    template <NnueType Nt, Color c, unsigned int NnueFtHalfdims, unsigned int NnuePsqtBuckets> void AccumulatorDebug();
+    template <NnueType Nt, Color c, unsigned int NnueFtHalfdims, unsigned int NnuePsqtBuckets> void AccumulatorDebug(int16_t* accumulation, int32_t* psqtAccumulation);
 #endif
 
     template <NnueType Nt, unsigned int NnueFtHalfdims, unsigned int NnuePsqtBuckets> int Transform(clipped_t *output, int bucket = 0);
@@ -1942,6 +1980,10 @@ public:
     {
         myos = &cout;
         freq = 0;
+    }
+    ~GuiCommunication()
+    {
+        delete nullos;
     }
     template <typename T>
     GuiCommunication& operator<<(const T& thing) {
@@ -2415,7 +2457,7 @@ public:
     int chunkstate[2];
     U64 rndseed;
 #endif
-    uint64_t bottompadding[6];
+    uint64_t bottompadding[7];
     void idle_loop() {
         bind_thread(index);
         while (true)

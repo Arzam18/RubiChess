@@ -127,7 +127,7 @@ inline int chessposition::getHistory(uint32_t code)
     int to = GETCORRECTTO(code);
     int value = history[s2m][threatSquare][from][to];
     int pieceTo = pc * 64 + to;
-    value += (conthistptr[ply - 1][pieceTo] + conthistptr[ply - 2][pieceTo] + conthistptr[ply - 4][pieceTo]);
+    value += (conthistptr[ply + 5][pieceTo] + conthistptr[ply + 4][pieceTo] + conthistptr[ply + 2][pieceTo]);
 
     return value;
 }
@@ -142,7 +142,7 @@ inline void chessposition::updateHistory(uint32_t code, int value)
     value = max(-HISTORYMAXDEPTH * HISTORYMAXDEPTH, min(HISTORYMAXDEPTH * HISTORYMAXDEPTH, value));
 
     int delta = value * (1 << HISTORYNEWSHIFT) - history[s2m][threatSquare][from][to] * abs(value) / (1 << HISTORYAGESHIFT);
-    myassert(history[s2m][threatSquare][from][to] + delta < MAXINT16 && history[s2m][threatSquare][from][to] + delta > MININT16, this, 2, history[s2m][from][to], delta);
+    myassert(history[s2m][threatSquare][from][to] + delta < INT16_MAX && history[s2m][threatSquare][from][to] + delta > INT16_MIN, this, 2, history[s2m][from][to], delta);
 
     history[s2m][threatSquare][from][to] += delta;
     int pieceTo = pc * 64 + to;
@@ -150,8 +150,8 @@ inline void chessposition::updateHistory(uint32_t code, int value)
     for (int i : {0, 1, 3}) {
         if (i >= maxplies)
             break;
-        delta = value * (1 << HISTORYNEWSHIFT) - conthistptr[ply - 1 - i][pieceTo] * abs(value) / (1 << HISTORYAGESHIFT);
-        conthistptr[ply - 1 - i][pieceTo] += delta;
+        delta = value * (1 << HISTORYNEWSHIFT) - conthistptr[ply + 5 - i][pieceTo] * abs(value) / (1 << HISTORYAGESHIFT);
+        conthistptr[ply + 5 - i][pieceTo] += delta;
     }
 }
 
@@ -175,7 +175,7 @@ inline void chessposition::updateTacticalHst(uint32_t code, int value)
     value = max(-HISTORYMAXDEPTH * HISTORYMAXDEPTH, min(HISTORYMAXDEPTH * HISTORYMAXDEPTH, value));
 
     int delta = value * (1 << HISTORYNEWSHIFT) - tacticalhst[pt][to][cp] * abs(value) / (1 << HISTORYAGESHIFT);
-    myassert(tacticalhst[pt][to][cp] + delta < MAXINT16 && tacticalhst[pt][to][cp] + delta > MININT16, this, 2, tacticalhst[pt][to][cp], delta);
+    myassert(tacticalhst[pt][to][cp] + delta < INT16_MAX && tacticalhst[pt][to][cp] + delta > INT16_MIN, this, 2, tacticalhst[pt][to][cp], delta);
 
     tacticalhst[pt][to][cp] += delta;
 }
@@ -797,7 +797,7 @@ int chessposition::alphabeta(int alpha, int beta, int depth, bool cutnode)
                 int pc = GETPIECE(mc);
                 int to = GETCORRECTTO(mc);
                 int pieceTo = pc * 64 + to;
-                if (conthistptr[ply - 1][pieceTo] > he_threshold && conthistptr[ply - 2][pieceTo] > he_threshold)
+                if (conthistptr[ply + 5][pieceTo] > he_threshold && conthistptr[ply + 4][pieceTo] > he_threshold)
                 {
                     STATISTICSINC(extend_history);
                     extendMove = 1;
@@ -1404,7 +1404,7 @@ void mainSearch(workingthread *thr)
                     delta = SCOREWHITEWINS;
 
                 // new aspiration window
-                if (score == alpha)
+                if (score <= alpha)
                 {
                     // research with lower alpha and reduced beta
                     beta = (alpha + beta) / 2;
@@ -1412,7 +1412,7 @@ void mainSearch(workingthread *thr)
                     delta = min(SCOREWHITEWINS, delta + delta / sps.aspincratio + sps.aspincbase);
                     inWindow = 0;
                 }
-                else if (score == beta)
+                else if (score >= beta)
                 {
                     // research with higher beta
                     beta = min(SCOREWHITEWINS, beta + delta);
@@ -1433,20 +1433,13 @@ void mainSearch(workingthread *thr)
                 }
             } else {
                 // We have a tablebase score so report this if no mate was found
+                uciNeedsFinalReport = !isMultiPV;
                 int tbScore = pos->rootmovelist.move[0].value;
-                if ((tbScore > 0 && score < tbScore) || (tbScore < 0 && score > tbScore))
+                if ((tbScore > 0 && score < tbScore) || (tbScore < 0 && score > tbScore) || tbScore == 0)
                     // Correct with tablebase score
                     score = pos->bestmovescore[0] = tbScore;
             }
         }
-
-        // exit if STOPIMMEDIATELY
-        if (en.stopLevel == ENGINESTOPIMMEDIATELY)
-            break;
-
-        // exit when max nodes reached
-        if (en.maxnodes && !en.LimitNps && pos->nodes >= en.maxnodes)
-            break;
 
         if (pos->pvtable[0][0])
         {
@@ -1460,6 +1453,14 @@ void mainSearch(workingthread *thr)
             }
             pos->lastpv[i] = 0;
         }
+
+        // exit if STOPIMMEDIATELY
+        if (en.stopLevel == ENGINESTOPIMMEDIATELY)
+            break;
+
+        // exit when max nodes reached
+        if (en.maxnodes && !en.LimitNps && pos->nodes >= en.maxnodes)
+            break;
 
         if (isMainThread)
             nowtime = getTime();
@@ -1627,8 +1628,10 @@ void mainSearch(workingthread *thr)
             {
                 bestscore = hthr->pos->bestmovescore[0];
                 bestthr = hthr;
+                inWindow = 1;
             }
         }
+
         if (pos->bestmove != bestthr->pos->bestmove)
         {
             // copy best moves and score from best thread to thread 0
@@ -1643,7 +1646,6 @@ void mainSearch(workingthread *thr)
             pos->bestmove = bestthr->pos->bestmove;
             pos->pondermove = bestthr->pos->pondermove;
             pos->bestmovescore[0] = bestthr->pos->bestmovescore[0];
-            inWindow = 1;
         }
 
         // remember score for next search in case of an instamove

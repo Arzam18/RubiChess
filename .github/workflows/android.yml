@@ -19,27 +19,32 @@ jobs:
           echo "ANDROID_NDK_HOME=$PWD/android-ndk-r26d" >> $GITHUB_ENV
           echo "$PWD/android-ndk-r26d/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
-      - name: Patch Makefile and cputest.cpp for ARM64
+      - name: Patch Makefile and cputest.cpp for Android ARM64
         run: |
           cd src
           
-          # 1. Patch Makefile to use llvm-objcopy for embedding network file
           python3 -c '
           import re
+
+          # 1. Patch Makefile for llvm-objcopy and remove -lrt
           with open("Makefile", "r") as f:
               content = f.read()
+
           pattern = r"\bld\s+-r\s+-b\s+binary\s+\$\(NETBIN\)\s+-o\s+\$\(NETOBJ\)"
           replacement = "$(ANDROID_NDK_HOME)/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-objcopy -I binary -O elf64-littleaarch64 -B aarch64 $(NETBIN) $(NETOBJ)"
-          new_content, count = re.subn(pattern, replacement, content)
-          with open("Makefile", "w") as f:
-              f.write(new_content)
-          print(f"Patched Makefile embedding rule ({count} instances).")
-          '
+          content = re.sub(pattern, replacement, content)
 
-          # 2. Patch cputest.cpp with ARM64 CPUID fallback macro
-          python3 -c '
+          # Strip -lrt flag (not present on Android)
+          content = content.replace("-lrt", "")
+
+          with open("Makefile", "w") as f:
+              f.write(content)
+          print("Patched Makefile for embedding and removed -lrt.")
+
+          # 2. Patch cputest.cpp with CPUID fallback for non-x86
           with open("cputest.cpp", "r") as f:
-              content = f.read()
+              cp_content = f.read()
+
           dummy_cpuid = """
           #if !defined(__x86_64__) && !defined(_M_X64) && !defined(__i386__) && !defined(_M_IX86)
           #ifndef CPUID
@@ -48,7 +53,7 @@ jobs:
           #endif
           """
           with open("cputest.cpp", "w") as f:
-              f.write(dummy_cpuid + "\n" + content)
+              f.write(dummy_cpuid + "\n" + cp_content)
           print("Patched cputest.cpp with ARM64 CPUID fallback.")
           '
 

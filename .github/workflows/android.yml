@@ -19,27 +19,40 @@ jobs:
           echo "ANDROID_NDK_HOME=$PWD/android-ndk-r26d" >> $GITHUB_ENV
           echo "$PWD/android-ndk-r26d/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
-      - name: Robustly patch net embedding for cross-compile
+      - name: Patch Makefile and cputest.cpp for ARM64
         run: |
           cd src
+          
+          # 1. Patch Makefile to use llvm-objcopy for embedding network file
           python3 -c '
           import re
           with open("Makefile", "r") as f:
               content = f.read()
-          
-          # Replace ld embedding command with llvm-objcopy across any upstream formatting variations
           pattern = r"\bld\s+-r\s+-b\s+binary\s+\$\(NETBIN\)\s+-o\s+\$\(NETOBJ\)"
           replacement = "$(ANDROID_NDK_HOME)/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-objcopy -I binary -O elf64-littleaarch64 -B aarch64 $(NETBIN) $(NETOBJ)"
-          
           new_content, count = re.subn(pattern, replacement, content)
-          print(f"Patched {count} embedding rule(s).")
-          
           with open("Makefile", "w") as f:
               f.write(new_content)
+          print(f"Patched Makefile embedding rule ({count} instances).")
           '
-          cat Makefile | grep -C 3 "llvm-objcopy" || true
 
-      - name: Build
+          # 2. Patch cputest.cpp with ARM64 CPUID fallback macro
+          python3 -c '
+          with open("cputest.cpp", "r") as f:
+              content = f.read()
+          dummy_cpuid = """
+          #if !defined(__x86_64__) && !defined(_M_X64) && !defined(__i386__) && !defined(_M_IX86)
+          #ifndef CPUID
+          #define CPUID(info, val) do { (info)[0] = (info)[1] = (info)[2] = (info)[3] = 0; } while(0)
+          #endif
+          #endif
+          """
+          with open("cputest.cpp", "w") as f:
+              f.write(dummy_cpuid + "\n" + content)
+          print("Patched cputest.cpp with ARM64 CPUID fallback.")
+          '
+
+      - name: Build RubiChess (ARM64 DotProd)
         run: |
           cd src
           make build ARCH=armv8-dotprod COMP=ndk EVALFILE=default -j$(nproc)
